@@ -348,18 +348,9 @@ curl -X DELETE \
   -H "X-Api-Key: $API_KEY"
 #rm "$FILE_PATH"
 
-sleep 15
+sleep 1
 
 echo "Calling Sonarr API to import resulting file"
-#curl -X POST \
-#  -H "X-Api-Key: $API_KEY" \
-#  -H "Content-Type: application/json" \
-#  "$SONARR_URL/api/v3/command" \
-#  -d '{
-#    "name": "DownloadedEpisodesScan",
-#    "path": "'"$BASE_FILE_PATH"'"
-#  }'
-
 RESPONSE=$(curl -X POST \
   -H "X-Api-Key: $API_KEY" \
   -H "Content-Type: application/json" \
