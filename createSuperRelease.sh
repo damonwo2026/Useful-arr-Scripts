@@ -1,8 +1,11 @@
 #!/bin/bash
 #exec > /root/superReleaseScript.log 2>&1
-API_KEY="secret" # your sonarr API key
-SONARR_URL="http://127.0.0.1:8989" # your local sonarr URL
-SONARR_DB_PATH="/opt/sonarr/config/sonarr.db" # absolute host path to sonarr database
+set +H
+START_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+echo "$START_TIME IS START_TIME"
+API_KEY="2fbcb11cac274b679ff3b823611ab2f9" # your sonarr API key
+SONARR_URL="http://192.168.178.45:8989" # your local sonarr URL
+SONARR_DB_PATH="/opt/sonarr-anime/config/sonarr.db" # absolute host path to sonarr database
 
 FILE_PATH="/hdd/media/anime/OnePiece/Season 1/episode1.mkv" # absolute host path to media file
 FILE_PATH="$1"
@@ -20,10 +23,16 @@ ENGLISH_ID=1 # internal sonarr Language IDs (probably the same for everyone)
 GERMAN_ID=4
 
 
+#curl -s \
+#        -H "X-Api-Key: $API_KEY" \
+#        "$SONARR_URL/api/v3/history/since?date=2026-09-08T16:18:38Z"
+
+#exit 0
 
 
-### Retrieve file ###
-SHORT_PATH=$(echo "$FILE_PATH" | sed -E 's|^.*/(Season [0-9]+/.*)|\1|')
+echo "Processing: $FILE_PATH"
+### Retrieve file path ###
+SHORT_PATH=$(printf "%s\n" "$FILE_PATH" | grep -oE '(Season [0-9]+/.*|Specials/.*)')
 REL_PATH=$(printf "%s" "$SHORT_PATH" | sed "s/'/''/g")
 echo "Handling file: $REL_PATH"
 
@@ -85,10 +94,10 @@ SELECT EXISTS (
 ### only process files that either have german or english audio stream ###
 if [[ "$HAS_ENGLISH" -eq 1 && "$HAS_GERMAN" -eq 1 ]]; then
     echo "German and English included. Exiting"
-    exit 0
+    exit 1
 elif [[ "$HAS_ENGLISH" != 1 && "$HAS_GERMAN" != 1 ]]; then
     echo "German and English missing. Exiting"
-    exit 0
+    exit 1
 elif [[ "$HAS_GERMAN" -eq 1 ]]; then
     echo "English missing"
     MISSING_LANG="$QualityProfileId_eng"
@@ -151,13 +160,13 @@ while true; do
     REPORTS=$(jq -r '.message | capture("(?<count>[0-9]+) reports downloaded") | .count' <<< "$RESPONSE")
 
     echo "Sonarr Command Status: $STATUS"
-    echo "Reports downloaded: $REPORTS"
 
     if [[ "$STATUS" == "completed" ]]; then
+        echo "Reports downloaded: $REPORTS"
         break
     fi
-
-    echo "Retrying in 5 seconds"
+    echo "Release is still being searched"
+    echo "Next check in 5 seconds"
     sleep 5
 done
 
@@ -171,6 +180,8 @@ fi
 
 
 ### Use sonarr API to periodically check the queue for when the new release has been downloaded ###
+DOWNLOAD_ID="0"
+RETRY_COUNTER=0
 while true; do
     RESPONSE=$(curl -s \
       -H "X-Api-Key: $API_KEY" \
@@ -181,14 +192,74 @@ while true; do
     QUEUE_ENTRY=$(jq -c --argjson id "$EPISODE_ID" \
         '.records[] | select(.episodeId == $id)' <<< "$RESPONSE")
 
-    if [[ -z "$QUEUE_ENTRY" ]]; then
+
+    if [[ $RETRY_COUNTER -ge 3 ]]; then
+      echo "Tried 3 times and still no Queue Entry. Checking for failed download."
+      echo "$SONARR_URL/api/v3/history/since?date=$START_TIME"
+      HISTORY=$(curl -s \
+        -H "X-Api-Key: $API_KEY" \
+        "$SONARR_URL/api/v3/history/since?date=$START_TIME")
+      echo "$HISTORY"
+
+      HISTORY_STATUS=$(echo "$HISTORY" | jq -r '
+          map(select(.eventType == "downloadFailed"))
+          | sort_by(.date)
+          | reverse
+          | .[0].eventType
+        ')
+
+      if [[ "$HISTORY_STATUS" == "null" ]]; then
+        echo "Found no failed download since start of script"
+        echo "TEST" ### HIER WEITERMACHEN
+        exit 1
+      else
+        echo "Found failed download: $HISTORY_STATUS"
+        echo "Re-Running Script"
+        sleep 5
+        exec "$0" "$@"
+      fi
+    elif [[ -z "$QUEUE_ENTRY" && "$DOWNLOAD_ID" != "0" ]]; then
+      echo "Queue Entry is gone. Checking Sonarr History for whether download has failed."
+
+      HISTORY=$(curl -s \
+          -H "X-Api-Key: $API_KEY" \
+          "$SONARR_URL/api/v3/history?downloadid=$DOWNLOAD_ID&pageSize=50")
+      echo "$HISTORY"
+
+      # retrieve history ID
+      echo "Retrieving History for Download ID $DOWNLOAD_ID"
+      HISTORY_STATUS=$(echo "$HISTORY" | jq -r '
+          .records
+          | sort_by(.date)
+          | reverse
+          | .[0].eventType
+        ')
+#          | map(select(.eventType == "grabbed"))
+
+      echo "Found History Status: $HISTORY_STATUS"
+      if [[ "$HISTORY_STATUS" == "downloadFailed" ]]; then
+        MESSAGE=$(echo "$HISTORY" | jq -r '
+            .records
+            | map(select(.eventType == "downloadFailed"))
+            | .[0].data.message
+        ')
+
+        echo "Download failed at Download Manager. Reason: $MESSAGE"
+        echo "Waiting for new Queue Entry."
+        DOWNLOAD_ID="0"
+        RETRY_COUNTER=0
+        continue
+      fi
+    elif [[ -z "$QUEUE_ENTRY" ]]; then
         echo "No Queue Entry for $EPISODE_ID found yet. Retrying in 10 seconds."
+        RETRY_COUNTER+=1
         sleep 10
         continue
     fi
 
     STATUS=$(jq -r '.status' <<< "$QUEUE_ENTRY")
     TIMELEFT=$(jq -r '.timeleft // empty' <<< "$QUEUE_ENTRY")
+    DOWNLOAD_ID=$(jq -r '.downloadId // 0' <<< "$QUEUE_ENTRY")
 
     echo "Sonarr Status: $STATUS"
     echo "Timeleft: $TIMELEFT"
@@ -201,7 +272,9 @@ while true; do
     fi
 
     if [[ "$TIMELEFT" =~ ^[0-9]{2}:[0-9]{2}:[0-9]{2}$ ]]; then
-        IFS=: read -r HOURS MINUTES SECONDS <<< "$TIMELEFT"
+        HOURS="${TIMELEFT:0:2}"
+        MINUTES="${TIMELEFT:3:2}"
+        SECONDS="${TIMELEFT:6:2}"
         SLEEP_TIME=$((10#$HOURS * 3600 + 10#$MINUTES * 60 + 10#$SECONDS))
     else
         SLEEP_TIME=30
@@ -348,9 +421,18 @@ curl -X DELETE \
   -H "X-Api-Key: $API_KEY"
 #rm "$FILE_PATH"
 
-sleep 1
+sleep 15
 
 echo "Calling Sonarr API to import resulting file"
+#curl -X POST \
+#  -H "X-Api-Key: $API_KEY" \
+#  -H "Content-Type: application/json" \
+#  "$SONARR_URL/api/v3/command" \
+#  -d '{
+#    "name": "DownloadedEpisodesScan",
+#    "path": "'"$BASE_FILE_PATH"'"
+#  }'
+
 RESPONSE=$(curl -X POST \
   -H "X-Api-Key: $API_KEY" \
   -H "Content-Type: application/json" \
@@ -402,3 +484,4 @@ curl -X POST \
 
 echo "Script is completed."
 exit 0
+
