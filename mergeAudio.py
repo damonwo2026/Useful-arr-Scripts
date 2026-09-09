@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-
 import argparse
 import json
 import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +16,24 @@ WINDOW_SECONDS = 0.025
 HOP_SECONDS = 0.010
 ANALYSIS_SECONDS = 60
 MAX_OFFSET = 30.0
+
+
+LANGUAGE_ALIASES = {
+    "ger": ["ger", "deu", "de"],
+    "deu": ["ger", "deu", "de"],
+    "de": ["ger", "deu", "de"],
+    "eng": ["eng", "en", "enq"],
+    "en": ["eng", "en", "enq"]
+}
+
+
+LANGUAGE_NAMES = {
+    "ger": "German",
+    "deu": "German",
+    "de": "German",
+    "eng": "English",
+    "en": "English"
+}
 
 
 def check_command(command):
@@ -48,29 +64,36 @@ def get_streams(path):
     return json.loads(result.stdout)["streams"]
 
 
-def find_audio_stream(path, language):
-    language_map = {
-        "ger": ["ger", "deu", "de"],
-        "eng": ["eng", "en", "enq"]
-    }
-
-    wanted = language_map[language]
-
-    streams = [
-        s for s in get_streams(path)
-        if s.get("codec_type") == "audio"
+def get_audio_streams(path):
+    return [
+        stream
+        for stream in get_streams(path)
+        if stream.get("codec_type") == "audio"
     ]
 
-    for index, stream in enumerate(streams):
+
+def find_audio_stream(path, language):
+    wanted = LANGUAGE_ALIASES.get(
+        language.lower(),
+        [language.lower()]
+    )
+
+    audio_streams = get_audio_streams(path)
+
+    for index, stream in enumerate(audio_streams):
         lang = stream.get("tags", {}).get("language", "").lower()
 
         if lang in wanted:
             return index, stream
 
-    if not streams:
-        raise RuntimeError(f"Keine Audiospur in {path} gefunden.")
+    if not audio_streams:
+        raise RuntimeError(
+            f"Keine Audiospur in {path} gefunden."
+        )
 
-    return 0, streams[0]
+    raise RuntimeError(
+        f"Keine Audiospur mit Language Tag '{language}' in {path} gefunden."
+    )
 
 
 def get_duration(path):
@@ -106,9 +129,14 @@ def extract_audio(path, stream_index, start, duration):
     )
 
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.decode(errors="replace"))
+        raise RuntimeError(
+            result.stderr.decode(errors="replace")
+        )
 
-    return np.frombuffer(result.stdout, dtype=np.int16).astype(np.float32)
+    return np.frombuffer(
+        result.stdout,
+        dtype=np.int16
+    ).astype(np.float32)
 
 
 def energy_envelope(audio):
@@ -121,7 +149,10 @@ def energy_envelope(audio):
     count = 1 + (len(audio) - window) // hop
 
     shape = (count, window)
-    strides = (audio.strides[0] * hop, audio.strides[0])
+    strides = (
+        audio.strides[0] * hop,
+        audio.strides[0]
+    )
 
     frames = np.lib.stride_tricks.as_strided(
         audio,
@@ -129,7 +160,9 @@ def energy_envelope(audio):
         strides=strides
     )
 
-    rms = np.sqrt(np.mean(frames ** 2, axis=1) + 1e-12)
+    rms = np.sqrt(
+        np.mean(frames ** 2, axis=1) + 1e-12
+    )
 
     db = 20 * np.log10(rms + 1e-12)
 
@@ -140,13 +173,19 @@ def energy_envelope(audio):
     if std > 0:
         db /= std
 
-    db = gaussian_filter1d(db, sigma=2)
+    db = gaussian_filter1d(
+        db,
+        sigma=2
+    )
 
     return db
 
 
 def find_offset(base_energy, source_energy):
-    length = min(len(base_energy), len(source_energy))
+    length = min(
+        len(base_energy),
+        len(source_energy)
+    )
 
     base_energy = base_energy[:length]
     source_energy = source_energy[:length]
@@ -158,7 +197,9 @@ def find_offset(base_energy, source_energy):
     source_std = np.std(source_energy)
 
     if base_std == 0 or source_std == 0:
-        raise RuntimeError("Zu wenig verwertbare Audioenergie.")
+        raise RuntimeError(
+            "Zu wenig verwertbare Audioenergie."
+        )
 
     base_energy /= base_std
     source_energy /= source_std
@@ -180,7 +221,13 @@ def find_offset(base_energy, source_energy):
     return offset, corr[peak]
 
 
-def analyze_segment(base_path, source_path, source_stream, start, duration):
+def analyze_segment(
+    base_path,
+    source_path,
+    source_stream,
+    start,
+    duration
+):
     base_audio = extract_audio(
         base_path,
         0,
@@ -198,7 +245,10 @@ def analyze_segment(base_path, source_path, source_stream, start, duration):
     base_energy = energy_envelope(base_audio)
     source_energy = energy_envelope(source_audio)
 
-    return find_offset(base_energy, source_energy)
+    return find_offset(
+        base_energy,
+        source_energy
+    )
 
 
 def create_output(
@@ -209,28 +259,30 @@ def create_output(
     offset,
     output_path
 ):
-    language_name = {
-        "ger": "German",
-        "eng": "English"
-    }[language]
+    base_audio_streams = get_audio_streams(base_path)
+    base_audio_count = len(base_audio_streams)
+    new_audio_index = base_audio_count
 
-    filter_parts = []
+    language_lower = language.lower()
+    language_name = LANGUAGE_NAMES.get(
+        language_lower,
+        language
+    )
 
     if offset < 0:
         trim = abs(offset)
 
-        filter_parts.append(
+        audio_filter = (
             f"[1:a:{source_stream}]"
             f"atrim=start={trim:.6f},"
             f"asetpts=PTS-STARTPTS,"
             f"aresample=async=1"
             f"[syncaudio]"
         )
-
     else:
         delay_ms = int(round(offset * 1000))
 
-        filter_parts.append(
+        audio_filter = (
             f"[1:a:{source_stream}]"
             f"adelay={delay_ms}:all=1,"
             f"asetpts=PTS-STARTPTS,"
@@ -243,35 +295,61 @@ def create_output(
         "-y",
         "-i", str(base_path),
         "-i", str(source_path),
-        "-filter_complex", ";".join(filter_parts),
+        "-filter_complex", audio_filter,
         "-map", "0:v?",
         "-map", "0:a?",
         "-map", "[syncaudio]",
         "-map", "0:s?",
         "-map", "0:t?",
-        "-c:v", "copy",
-        "-c:a", "copy",
-        "-c:s", "copy",
-        "-c:t", "copy",
-        "-metadata:s:a:1", f"language={language}",
-        "-metadata:s:a:1", f"title={language_name}",
-        "-map_metadata", "0",
-        "-map_chapters", "0",
-        "-c:a:1", "aac",
-        "-b:a:1", "192k",
-        str(output_path)
+        "-c:v", "copy"
     ]
 
-    subprocess.run(command, check=True)
+    for audio_index in range(base_audio_count):
+        command.extend([
+            f"-c:a:{audio_index}",
+            "copy"
+        ])
+
+    command.extend([
+        f"-c:a:{new_audio_index}",
+        "aac",
+        f"-b:a:{new_audio_index}",
+        "192k",
+        "-c:s", "copy",
+        "-c:t", "copy",
+        f"-metadata:s:a:{new_audio_index}",
+        f"language={language}",
+        f"-metadata:s:a:{new_audio_index}",
+        f"title={language_name}",
+        "-map_metadata", "0",
+        "-map_chapters", "0",
+        str(output_path)
+    ])
+
+    subprocess.run(
+        command,
+        check=True
+    )
 
 
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("base_video")
-    parser.add_argument("audio_source")
-    parser.add_argument("language", choices=["ger", "eng"])
-    parser.add_argument("output")
+    parser.add_argument(
+        "base_video"
+    )
+
+    parser.add_argument(
+        "audio_source"
+    )
+
+    parser.add_argument(
+        "language"
+    )
+
+    parser.add_argument(
+        "output"
+    )
 
     args = parser.parse_args()
 
@@ -283,11 +361,15 @@ def main():
     output_path = Path(args.output)
 
     if not base_path.is_file():
-        print(f"Fehler: Base-Video nicht gefunden: {base_path}")
+        print(
+            f"Fehler: Base-Video nicht gefunden: {base_path}"
+        )
         sys.exit(1)
 
     if not source_path.is_file():
-        print(f"Fehler: Audio-Quelle nicht gefunden: {source_path}")
+        print(
+            f"Fehler: Audio-Quelle nicht gefunden: {source_path}"
+        )
         sys.exit(1)
 
     source_stream, source_info = find_audio_stream(
@@ -295,13 +377,22 @@ def main():
         args.language
     )
 
-    base_audio_streams = [
-        s for s in get_streams(base_path)
-        if s.get("codec_type") == "audio"
-    ]
+    base_audio_streams = get_audio_streams(
+        base_path
+    )
 
-    print(f"Base audio tracks: {len(base_audio_streams)}")
-    print(f"Selected source audio track: {source_stream}")
+    print(
+        f"Base audio tracks: {len(base_audio_streams)}"
+    )
+
+    print(
+        f"Selected source audio track: {source_stream}"
+    )
+
+    print(
+        f"Source language: "
+        f"{source_info.get('tags', {}).get('language', '')}"
+    )
 
     duration = min(
         get_duration(base_path),
@@ -317,7 +408,9 @@ def main():
 
     offsets = []
 
-    print("Analyzing audio energy patterns...")
+    print(
+        "Analyzing audio energy patterns..."
+    )
 
     for start in segment_starts:
         segment_duration = min(
@@ -349,23 +442,34 @@ def main():
         offsets.append(offset)
 
     if not offsets:
-        print("Fehler: Keine Analyseergebnisse.")
+        print(
+            "Fehler: Keine Analyseergebnisse."
+        )
         sys.exit(1)
 
-    print(f"\nDetected offsets: {offsets}")
+    print(
+        f"\nDetected offsets: {offsets}"
+    )
 
-    median_offset = float(np.median(offsets))
+    median_offset = float(
+        np.median(offsets)
+    )
 
     valid_offsets = [
-        offset for offset in offsets
+        offset
+        for offset in offsets
         if abs(offset - median_offset) <= 0.5
     ]
 
     if not valid_offsets:
-        print("Fehler: Offset-Ergebnisse sind nicht konsistent.")
+        print(
+            "Fehler: Offset-Ergebnisse sind nicht konsistent."
+        )
         sys.exit(1)
 
-    final_offset = float(np.median(valid_offsets))
+    final_offset = float(
+        np.median(valid_offsets)
+    )
 
     if abs(final_offset) > MAX_OFFSET:
         print(
@@ -374,9 +478,13 @@ def main():
         )
         sys.exit(1)
 
-    print(f"Final offset: {final_offset:.3f}s")
+    print(
+        f"Final offset: {final_offset:.3f}s"
+    )
 
-    print("Muxing synchronized audio...")
+    print(
+        "Muxing synchronized audio..."
+    )
 
     create_output(
         base_path,
@@ -387,8 +495,11 @@ def main():
         output_path
     )
 
-    print(f"Output: {output_path}")
+    print(
+        f"Output: {output_path}"
+    )
 
 
 if __name__ == "__main__":
     main()
+
